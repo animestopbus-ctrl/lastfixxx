@@ -2,173 +2,224 @@
 # Don't Remove Credit
 # Telegram Channel @RexBots_Official
 
-
-
-from pyrogram.errors import InputUserDeactivated, UserNotParticipant, FloodWait, UserIsBlocked, PeerIdInvalid
-from database.db import db
-from pyrogram import Client, filters
-from config import ADMINS
+import logging
 import asyncio
 import datetime
 import time
-from pyrogram.types import Message
 import json
 import os
+from typing import Optional, List, Dict
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.errors import (
+    InputUserDeactivated, UserNotParticipant, FloodWait, UserIsBlocked, PeerIdInvalid
+)
+from database.db import db
+from config import ADMINS
 from logger import LOGGER
 
 logger = LOGGER(__name__)
 
 # ---------------------------------------------------
-# Broadcast helper function
+# Enhanced Broadcast Helper Function
 # ---------------------------------------------------
-async def broadcast_messages(user_id, message):
+async def broadcast_messages(client: Client, user_id: int, message: Message) -> tuple[bool, str]:
+    """
+    Attempts to forward a message to a user with robust error handling and retry logic.
+    """
     try:
-        await message.copy(chat_id=user_id)
+        await message.forward(chat_id=user_id)
         return True, "Success"
     except FloodWait as e:
+        logger.warning(f"FloodWait encountered for user {user_id}. Sleeping for {e.value} seconds.")
         await asyncio.sleep(e.value)
-        return await broadcast_messages(user_id, message)
+        return await broadcast_messages(client, user_id, message)
     except InputUserDeactivated:
         await db.delete_user(int(user_id))
+        logger.info(f"Deleted deactivated user {user_id}")
         return False, "Deleted"
     except UserIsBlocked:
-        await db.delete_user(int(user_id))
+        logger.info(f"User {user_id} has blocked the bot")
         return False, "Blocked"
     except PeerIdInvalid:
         await db.delete_user(int(user_id))
+        logger.info(f"Invalid peer for user {user_id}. Deleted from DB.")
         return False, "Error"
     except Exception as e:
-        logger.error(f"[!] Broadcast error for {user_id}: {e}")
+        logger.error(f"Broadcast error for {user_id}: {e}")
         return False, "Error"
 
 # ---------------------------------------------------
-# /broadcast command
+# /broadcast Command (Enhanced with Options and Progress Bar)
 # ---------------------------------------------------
-@Client.on_message(filters.command("broadcast") & filters.user(ADMINS))
-async def broadcast_command(bot: Client, message: Message):
-    b_msg = message.reply_to_message
-    if not b_msg:
+@Client.on_message(filters.command("broadcast") & filters.user(ADMINS) & filters.reply)
+async def broadcast_command(bot: Client, message: Message) -> None:
+    """
+    Broadcasts the replied message to all/premium users with real-time progress updates.
+    Usage: /broadcast [premium_only] (reply to message)
+    """
+    if not message.reply_to_message:
         return await message.reply_text(
-            "**__Reply to this command with the message you want to broadcast.__**",
+            "**Usage:** Reply to a message with /broadcast [premium_only]",
             quote=True
         )
-
-    users = await db.get_all_users()
+    
+    premium_only = len(message.command) > 1 and message.command[1].lower() == "premium_only"
+    b_msg = message.reply_to_message
+    
+    users_cursor = db.get_premium_users() if premium_only else db.get_all_users()
+    target_group = "Premium Users" if premium_only else "All Users"
+    
     sts = await message.reply_text(
-        text='**__Broadcasting your message...__**',
+        text=f"**__Preparing Broadcast to {target_group}...__**",
         quote=True
     )
-
+    
     start_time = time.time()
-    total_users = await db.total_users_count()
+    total_users = await db.total_premium_count() if premium_only else await db.total_users_count()
     done = 0
     blocked = 0
     deleted = 0
     failed = 0
     success = 0
-
-    async for user in users:
+    
+    async for user in users_cursor:
         user_id = user.get('id')
-        if user_id:
-            pti, sh = await broadcast_messages(int(user_id), b_msg)
-            if pti:
-                success += 1
-            else:
-                if sh == "Blocked":
-                    blocked += 1
-                elif sh == "Deleted":
-                    deleted += 1
-                elif sh == "Error":
-                    failed += 1
-            done += 1
-# Rexbots
-# Don't Remove Credit
-# Telegram Channel @RexBots_Official
-
-            if done % 20 == 0:
-                await sts.edit(
-                    f"**__Broadcast In Progress:__**\n\n"
-                    f"**👥 Total Users:** {total_users}\n"
-                    f"**💫 Completed:** {done} / {total_users}\n"
-                    f"**✅ Success:** {success}\n"
-                    f"**🚫 Blocked:** {blocked}\n"
-                    f"**🚮 Deleted:** {deleted}"
-                )
+        if not user_id or await db.is_banned(user_id):
+            continue  # Skip invalid or banned users
+        
+        pti, sh = await broadcast_messages(bot, user_id, b_msg)
+        if pti:
+            success += 1
         else:
-            done += 1
-            failed += 1
-            if done % 20 == 0:
-                await sts.edit(
-                    f"**__Broadcast In Progress:__**\n\n"
-                    f"**👥 Total Users:** {total_users}\n"
-                    f"**💫 Completed:** {done} / {total_users}\n"
-                    f"**✅ Success:** {success}\n"
-                    f"**🚫 Blocked:** {blocked}\n"
-                    f"**🚮 Deleted:** {deleted}"
-                )
-
+            if sh == "Blocked":
+                blocked += 1
+            elif sh == "Deleted":
+                deleted += 1
+            elif sh == "Error":
+                failed += 1
+        
+        done += 1
+        await asyncio.sleep(0.2)  # Gentle anti-flood delay
+        
+        # Real-time Progress Update with Bar
+        if done % 10 == 0 or done == total_users:  # Update every 10 users
+            percentage = (done / total_users * 100) if total_users > 0 else 0
+            bar_length = 20
+            filled = int(percentage / (100 / bar_length))
+            bar = '█' * filled + ' ' * (bar_length - filled)
+            
+            await sts.edit_text(
+                f"**__Broadcast In Progress to {target_group}:__**\n\n"
+                f"**Progress: [{bar}] {percentage:.1f}%**\n"
+                f"**👥 Total Users:** {total_users}\n"
+                f"**💫 Completed:** {done} / {total_users}\n"
+                f"**✅ Success:** {success}\n"
+                f"**🚫 Blocked:** {blocked}\n"
+                f"**🚮 Deleted:** {deleted}\n"
+                f"**❌ Failed:** {failed}"
+            )
+    
     time_taken = datetime.timedelta(seconds=int(time.time() - start_time))
-    await sts.edit(
-        f"**__Broadcast Completed:__**\n"
+    await sts.edit_text(
+        f"**__Broadcast Completed to {target_group}:__**\n\n"
+        f"**Progress: [██████████] 100%**\n"
         f"**⏰ Completed in:** {time_taken}\n\n"
         f"**👥 Total Users:** {total_users}\n"
         f"**💫 Completed:** {done} / {total_users}\n"
         f"**✅ Success:** {success}\n"
         f"**🚫 Blocked:** {blocked}\n"
-        f"**🚮 Deleted:** {deleted}"
+        f"**🚮 Deleted:** {deleted}\n"
+        f"**❌ Failed:** {failed}"
     )
 
 # ---------------------------------------------------
-# /users Command (Standalone + JSON export)
+# /users Command (Enhanced with Filters and Detailed Export)
 # ---------------------------------------------------
 @Client.on_message(filters.command("users") & filters.user(ADMINS))
-async def users_count(bot: Client, message: Message):
-    msg = await message.reply_text("⏳ <b>__Gathering User Data...__</b>", quote=True)
+async def users_count(bot: Client, message: Message) -> None:
+    """
+    Exports user data with optional filters (all, premium, banned) and detailed stats.
+    Usage: /users [all|premium|banned] (default: all)
+    """
+    filter_type = message.command[1].lower() if len(message.command) > 1 else "all"
+    
+    if filter_type not in ["all", "premium", "banned"]:
+        return await message.reply_text("**Invalid filter. Use: all, premium, or banned.**")
+    
+    msg = await message.reply_text(f"⏳ **__Gathering {filter_type.capitalize()} User Data...__**", quote=True)
+    
     try:
-        total = await db.total_users_count()
-        await msg.edit_text(
-            f"""
-🌀 <b><i>User Analytics Update</i></b> 🌀
-
-👥 <b>Total Registered Users:</b> {total}
-🛰 <b>System Status:</b> Active ✅
-🧠 <b>Data Source:</b> MongoDB (async)
-"""
-        )
-
-        users_cursor = await db.get_all_users()
-        users_list = []
+        if filter_type == "all":
+            users_cursor = db.get_all_users()
+            total = await db.total_users_count()
+        elif filter_type == "premium":
+            users_cursor = db.get_premium_users()
+            total = await db.total_premium_count()
+        elif filter_type == "banned":
+            users_cursor = db.get_banned_users()
+            total = await db.total_banned_count()
+        
+        # Detailed Stats
+        active_sessions = 0
+        total_daily_usage = 0
+        users_list: List[Dict] = []
+        
         async for user in users_cursor:
             users_list.append({
-                "name": user.get("name", "None"),
-                "username": user.get("username", "None"),
-                "id": user.get("id")
+                "id": user.get("id"),
+                "name": user.get("name", "Unknown"),
+                "username": user.get("username", "Unknown"),
+                "is_premium": user.get("is_premium", False),
+                "premium_expiry": str(user.get("premium_expiry", "N/A")),
+                "is_banned": user.get("is_banned", False),
+                "daily_usage": user.get("daily_usage", 0),
+                "limit_reset_time": str(user.get("limit_reset_time", "N/A")),
+                "session_active": bool(user.get("session")),
+                "dump_chat": user.get("dump_chat", "None"),
+                "delete_words_count": len(user.get("delete_words", [])),
+                "replace_words_count": len(user.get("replace_words", {})),
+                "caption_set": bool(user.get("caption")),
+                "thumbnail_set": bool(user.get("thumbnail"))
             })
-
-        tmp_path = "SaveRestricted.json"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(users_list, f, indent=2, ensure_ascii=False)
-
-        caption = f"📄 **Recorded {len(users_list)} Users**"
-        await message.reply_document(
-            document=tmp_path,
-            caption=caption
+            active_sessions += 1 if user.get("session") else 0
+            total_daily_usage += user.get("daily_usage", 0)
+        
+        avg_daily_usage = total_daily_usage / total if total > 0 else 0
+        
+        await msg.edit_text(
+            f"🌀 **{filter_type.capitalize()} User Analytics Update** 🌀\n\n"
+            f"👥 **Total Users:** {total}\n"
+            f"🔑 **Active Sessions:** {active_sessions}\n"
+            f"📊 **Total Daily Usage:** {total_daily_usage}\n"
+            f"📈 **Avg Daily Usage/User:** {avg_daily_usage:.2f}\n"
+            f"🧠 **Data Source:** MongoDB (async)"
         )
-
-        try:
-            os.remove(tmp_path)
-        except Exception as e:
-            logger.error(f"[!] Failed to Delete File {tmp_path}: {e}")
-
+        
+        if users_list:
+            tmp_path = f"SaveRestricted_{filter_type}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(users_list, f, indent=4, ensure_ascii=False)
+            
+            caption = f"📄 **Exported {len(users_list)} {filter_type.capitalize()} Users**\n**Format:** JSON (Detailed)"
+            await message.reply_document(
+                document=tmp_path,
+                caption=caption,
+                quote=True
+            )
+            try:
+                os.remove(tmp_path)
+            except Exception as e:
+                logger.error(f"[!] Failed to delete file {tmp_path}: {e}")
+        else:
+            await message.reply_text("**No users found for this filter.**", quote=True)
     except Exception as e:
-        await msg.edit_text(f"**__⚠️ Error Fetching User Data:__**\n<code>{e}</code>")
+        await msg.edit_text(f"**⚠️ Error Fetching User Data:**\n<code>{e}</code>")
         logger.error(f"[!] /users error: {e}")
-
 
 # Credits
 # Developer Telegram: @RexBots_Official
 # Update channel: @RexBots_Official
-
 # Rexbots
 # Don't Remove Credit
 # Telegram Channel @RexBots_Official
